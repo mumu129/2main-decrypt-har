@@ -327,17 +327,14 @@
 <body>
   <header>
     <button id="menuBtn">☰</button>
-    <div id="menuPanel">
+           <div id="menuPanel">
       <label class="file-btn menu-item" style="cursor:pointer;">
         📂 选择 HAR
         <input type="file" id="harInput" accept=".har,.json,application/json">
       </label>
       <button class="menu-item" id="configBtn">⚙️ 解密配置</button>
-      <button class="menu-item" id="toggleFilterBtn" disabled>🔍 展开过滤</button>
       <div class="menu-sep"></div>
-      <button class="menu-item" id="autoDecryptAllBtn" disabled>🔓 批量解密</button>
-      <button class="menu-item" id="exportBtn" disabled>💾 导出解密 HAR</button>
-      <button class="menu-item" id="exportListBtn" disabled>📤 导出筛选 HAR</button>
+      <button class="menu-item" id="exportListBtn" disabled>📤 导出筛选 HAR（自动解密）</button>
     </div>
     <span id="stats">未加载</span>
   </header>
@@ -382,7 +379,7 @@
             </div>
             <div class="warn">
               ⚠️ 清除应用数据会丢配置，建议用「💾 备份 (json)」定期导出。<br>
-              💡 「🔄 从脚本重新导入」会清空应用内数据，重新从 <code>decoders.js</code> / <code>rules.js</code> 读取一次。
+              💡 「📥 导入算法 JS」从外部 <code>.js</code> 文件导入算法/规则/模板，文件中需赋值 <code>window.HAR_DECODERS</code> / <code>window.HAR_RULES</code> / <code>window.HAR_TEMPLATES</code>。导入会覆盖同 ID 的算法。
             </div>
           </div>
           <div class="panel-toolbar">
@@ -478,7 +475,14 @@
   </div>
 
   <script src="./pako.min.js"></script>
-  
-  <script src="./panel.js"></script>
+  <script src="./js/core.js"></script>
+  <script src="./js/state.js"></script>
+  <script src="./js/storage.js"></script>
+  <script src="./js/decoders.js"></script>
+  <script src="./js/list.js"></script>
+  <script src="./js/detail.js"></script>
+  <script src="./js/export-har.js"></script>
+  <script src="./js/config-ui.js"></script>
+  <script src="./js/app.js"></script>
 </body>
 </html>
