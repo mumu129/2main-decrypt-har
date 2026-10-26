@@ -1,8 +1,10 @@
-name: Build Windows EXE
+name: Build & Release Windows
 
 on:
-  
-  workflow_dispatch:   # 也允许手动触发
+  workflow_dispatch:   # 仅手动触发
+
+permissions:
+  contents: write      # 发布 Release 必需
 
 jobs:
   build:
@@ -18,11 +20,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Windows package
-        run: npx electron-builder --win --publish never
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installer
-          path: dist/*.exe
+      - name: Build & Publish
+        run: npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
