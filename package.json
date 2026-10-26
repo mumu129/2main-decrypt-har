@@ -4,10 +4,10 @@
   "description": "HAR 解密查看器 - Electron 桌面版",
   "main": "main.js",
   "author": "Local",
-  "scripts": {
+    "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "download-pako": "curl -o renderer/pako.min.js https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js",
+    "download-pako": "curl -o pako.min.js https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js",
     "pack": "electron-builder --dir",
     "build:win": "electron-builder --win",
     "build:portable": "electron-builder --win portable"
@@ -25,14 +25,13 @@
     "directories": {
       "output": "dist"
     },
-    "files": [
+        "files": [
       "main.js",
       "preload.js",
-      "index.js",
+      "index.html",
       "pako.min.js",
       "panel.js",
       "background.avif",
-      
       "package.json"
     ],
     "win": {
