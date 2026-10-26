@@ -1,0 +1,53 @@
+{
+  "name": "har-decrypt-electron",
+  "version": "1.0.0",
+  "description": "HAR 解密查看器 - Electron 桌面版",
+  "main": "main.js",
+  "author": "Local",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "download-pako": "curl -o renderer/pako.min.js https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js",
+    "pack": "electron-builder --dir",
+    "build:win": "electron-builder --win",
+    "build:portable": "electron-builder --win portable"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.local.har-decrypt",
+    "productName": "HAR Decrypt",
+    "asar": true,
+    "compression": "maximum",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "HAR Decrypt",
+      "deleteAppDataOnUninstall": false
+    }
+  }
+}
