@@ -59,7 +59,7 @@ function valueToText(v) {
 }
 
 // ================================================================
-// 智能解码（raw 内部使用）
+// 智能解码（helper）
 // ================================================================
 function isJsonLike(s) {
   const t = s.trim();
@@ -180,6 +180,197 @@ function getResponseText(entry) {
 }
 
 // ================================================================
+// localStorage
+// ================================================================
+const LS_KEYS = {
+  userDecoders: "har-decrypt:v1:userDecoders",
+  rules: "har-decrypt:v1:rules",
+  templates: "har-decrypt:v1:templates",
+  seeded: "har-decrypt:v1:seeded",
+};
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw == null) return fallback;
+    return JSON.parse(raw);
+  } catch { return fallback; }
+}
+function saveJSON(key, obj) {
+  try {
+    localStorage.setItem(key, JSON.stringify(obj));
+    return true;
+  } catch (e) {
+    showToast("存储失败: " + (e.message || e), "err");
+    return false;
+  }
+}
+let userDecoders = {};
+let fileRules = [];
+let userTemplates = {};
+
+// ================================================================
+// IndexedDB：库存储
+// ================================================================
+const LIB_DB = "har-decrypt-libs";
+const LIB_STORE = "libs";
+let _libDB = null;
+// _libIndex: name → { name, code, size, savedAt }（全量驻留内存，但不执行到 window）
+const _libIndex = new Map();
+// 已执行到 window 的库名
+const loadedLibs = new Set();
+// 库名 → 该库新增的全局名集合
+const pluginGlobals = new Map();
+// 防并发懒加载
+const libLoadPromises = new Map();
+
+function openLibDB() {
+  if (_libDB) return Promise.resolve(_libDB);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(LIB_DB, 1);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(LIB_STORE)) {
+        db.createObjectStore(LIB_STORE, { keyPath: "name" });
+      }
+    };
+    req.onsuccess = () => { _libDB = req.result; resolve(_libDB); };
+    req.onerror = () => reject(req.error);
+  });
+}
+async function refreshLibIndex() {
+  const db = await openLibDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(LIB_STORE, "readonly");
+    const req = tx.objectStore(LIB_STORE).getAll();
+    req.onsuccess = () => {
+      _libIndex.clear();
+      for (const lib of req.result || []) _libIndex.set(lib.name, lib);
+      resolve();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbPutLib(lib) {
+  const db = await openLibDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(LIB_STORE, "readwrite");
+    tx.objectStore(LIB_STORE).put(lib);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function dbDeleteLib(name) {
+  const db = await openLibDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(LIB_STORE, "readwrite");
+    tx.objectStore(LIB_STORE).delete(name);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// ================================================================
+// 库执行 / 卸载 / 懒加载 / CRUD
+// ================================================================
+function snapshotWindowKeys() {
+  return new Set(Object.getOwnPropertyNames(window));
+}
+function isValidParamName(name) {
+  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return false;
+  try { new Function(name, ""); return true; } catch { return false; }
+}
+function loadScriptViaBlob(name, content) {
+  return new Promise((resolve, reject) => {
+    const blob = new Blob([content], { type: "text/javascript" });
+    const url = URL.createObjectURL(blob);
+    const script = document.createElement("script");
+    script.src = url;
+    script.onload = () => { URL.revokeObjectURL(url); resolve(); };
+    script.onerror = () => { URL.revokeObjectURL(url); reject(new Error("脚本执行出错: " + name)); };
+    document.head.appendChild(script);
+  });
+}
+
+function _unloadLibGlobals(name) {
+  const keys = pluginGlobals.get(name);
+  if (keys) for (const k of keys) { try { delete window[k]; } catch {} }
+  pluginGlobals.delete(name);
+  loadedLibs.delete(name);
+}
+
+async function _execLib(lib) {
+  const before = snapshotWindowKeys();
+  await loadScriptViaBlob(lib.name, lib.code);
+  const set = pluginGlobals.get(lib.name) || new Set();
+  for (const k of Object.getOwnPropertyNames(window)) {
+    if (!before.has(k)) set.add(k);
+  }
+  pluginGlobals.set(lib.name, set);
+  loadedLibs.add(lib.name);
+  resetLibCache();
+}
+
+// 懒加载：缺哪个加载哪个（供 runDecoder / runEncoder 调用）
+async function ensureLibsLoaded(libNames) {
+  if (!libNames || !libNames.length) return;
+  await Promise.all(libNames.map(async (name) => {
+    if (loadedLibs.has(name)) return;
+    if (libLoadPromises.has(name)) return libLoadPromises.get(name);
+    const p = (async () => {
+      try {
+        const lib = _libIndex.get(name);
+        if (!lib) throw new Error(`算法依赖库「${name}」未保存。请到「第三方库」Tab 添加其代码。`);
+        await _execLib(lib);
+        console.log(`[HAR-Decrypt] 📚 懒加载: ${name}`, [...(pluginGlobals.get(name) || [])].join(", "));
+      } finally {
+        libLoadPromises.delete(name);
+      }
+    })();
+    libLoadPromises.set(name, p);
+    return p;
+  }));
+}
+
+// 保存：只写 IndexedDB + 更新内存索引，不执行
+async function saveLib(name, code) {
+  if (!name || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name))
+    throw new Error("库名必须是合法 JS 标识符（如 CryptoJS）");
+  if (!code || !String(code).trim())
+    throw new Error("代码不能为空");
+  const lib = { name, code: String(code), size: String(code).length, savedAt: Date.now() };
+  await dbPutLib(lib);
+  _libIndex.set(name, lib);
+}
+
+async function deleteLib(name) {
+  await dbDeleteLib(name);
+  _libIndex.delete(name);
+  _unloadLibGlobals(name);
+  resetLibCache();
+}
+
+async function reloadLib(name) {
+  const lib = _libIndex.get(name);
+  if (!lib) throw new Error("库不存在: " + name);
+  _unloadLibGlobals(name);
+  await _execLib(lib);
+}
+
+async function reloadAllLoadedLibs() {
+  const names = [...loadedLibs];
+  for (const n of names) _unloadLibGlobals(n);
+  resetLibCache();
+  await ensureLibsLoaded(names);
+}
+
+function guessLibName(filename) {
+  let base = filename.replace(/\.js$/i, "").replace(/\.min$/i, "");
+  base = base.replace(/[^A-Za-z0-9_$]/g, "_");
+  if (!/^[A-Za-z_$]/.test(base)) base = "_" + base;
+  return base || "MyLib";
+}
+
+// ================================================================
 // 默认模板
 // ================================================================
 const DEFAULT_TEMPLATES = {
@@ -212,28 +403,12 @@ const DEFAULT_TEMPLATES = {
   return btoa(bin);
 }`,
   },
-  inflate: {
-    label: "模板·zlib inflate（输入 base64）",
-    code: `function(text, ctx) {
-  const bin = atob(String(text).trim());
-  const t = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) t[i] = bin.charCodeAt(i);
-  return JSON.parse(new TextDecoder().decode(pako.inflate(t)));
-}`,
-    encode: `function(value, ctx) {
-  const s = typeof value === 'string' ? value : JSON.stringify(value);
-  const d = pako.deflate(new TextEncoder().encode(s));
-  let bin = '';
-  for (let i = 0; i < d.length; i++) bin += String.fromCharCode(d[i]);
-  return btoa(bin);
-}`,
-  },
   aesCbc: {
     label: "模板·AES-256-CBC（输入 base64，需 key + iv）",
     code: `async function(text, ctx) {
   const keys = ctx?.keys || {};
-  if (!keys.key) throw new Error('缺少密钥：请在域名规则中配置 keys.key');
-  if (!keys.iv) throw new Error('缺少 IV：请在域名规则中配置 keys.iv');
+  if (!keys.key) throw new Error('缺少密钥');
+  if (!keys.iv) throw new Error('缺少 IV');
   const hexToBytes = h => Uint8Array.from(String(h).replace(/\\s+/g, '').match(/../g) || [], x => parseInt(x, 16));
   const bin = atob(String(text).trim());
   const cipher = new Uint8Array(bin.length);
@@ -244,8 +419,8 @@ const DEFAULT_TEMPLATES = {
 }`,
     encode: `async function(value, ctx) {
   const keys = ctx?.keys || {};
-  if (!keys.key) throw new Error('缺少密钥：请在域名规则中配置 keys.key');
-  if (!keys.iv) throw new Error('缺少 IV：请在域名规则中配置 keys.iv');
+  if (!keys.key) throw new Error('缺少密钥');
+  if (!keys.iv) throw new Error('缺少 IV');
   const hexToBytes = h => Uint8Array.from(String(h).replace(/\\s+/g, '').match(/../g) || [], x => parseInt(x, 16));
   const s = typeof value === 'string' ? value : JSON.stringify(value);
   const plain = new TextEncoder().encode(s);
@@ -258,10 +433,10 @@ const DEFAULT_TEMPLATES = {
 }`,
   },
   aesGcm: {
-    label: "模板·AES-256-GCM（输入 base64：iv(12) || ct || tag(16)）",
+    label: "模板·AES-256-GCM（iv(12) || ct || tag(16)）",
     code: `async function(text, ctx) {
   const keys = ctx?.keys || {};
-  if (!keys.key) throw new Error('缺少密钥：请在域名规则中配置 keys.key');
+  if (!keys.key) throw new Error('缺少密钥');
   const hexToBytes = h => Uint8Array.from(String(h).replace(/\\s+/g, '').match(/../g) || [], x => parseInt(x, 16));
   const bin = atob(String(text).trim());
   const bytes = new Uint8Array(bin.length);
@@ -274,7 +449,7 @@ const DEFAULT_TEMPLATES = {
 }`,
     encode: `async function(value, ctx) {
   const keys = ctx?.keys || {};
-  if (!keys.key) throw new Error('缺少密钥：请在域名规则中配置 keys.key');
+  if (!keys.key) throw new Error('缺少密钥');
   const hexToBytes = h => Uint8Array.from(String(h).replace(/\\s+/g, '').match(/../g) || [], x => parseInt(x, 16));
   const s = typeof value === 'string' ? value : JSON.stringify(value);
   const plain = new TextEncoder().encode(s);
@@ -294,7 +469,7 @@ const DEFAULT_TEMPLATES = {
     code: `function(text, ctx) {
   const keys = ctx?.keys || {};
   const k = Number(keys.key);
-  if (!Number.isFinite(k)) throw new Error('缺少密钥：请在域名规则中配置 keys.key');
+  if (!Number.isFinite(k)) throw new Error('缺少密钥');
   const bin = atob(String(text).trim());
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) ^ k;
@@ -304,7 +479,7 @@ const DEFAULT_TEMPLATES = {
     encode: `function(value, ctx) {
   const keys = ctx?.keys || {};
   const k = Number(keys.key);
-  if (!Number.isFinite(k)) throw new Error('缺少密钥：请在域名规则中配置 keys.key');
+  if (!Number.isFinite(k)) throw new Error('缺少密钥');
   const s = typeof value === 'string' ? value : JSON.stringify(value);
   const src = new TextEncoder().encode(s);
   const out = new Uint8Array(src.length);
@@ -316,7 +491,7 @@ const DEFAULT_TEMPLATES = {
   },
 };
 function getTemplates() {
-  return { ...DEFAULT_TEMPLATES, ...(window.HAR_TEMPLATES || {}) };
+  return { ...DEFAULT_TEMPLATES, ...userTemplates };
 }
 
 // ================================================================
@@ -406,197 +581,182 @@ function renderJsonWithTs(data) {
 }
 
 // ================================================================
-// 内置解码器（字符串进 / 值出；encode 值进 / 字符串出）
+// 内置解码器（全部字符串 code，可被覆盖）
 // ================================================================
 const BUILTIN_DECODERS = {
   raw: {
     label: "智能解析（自动尝试 URL / Base64 / JSON / form）",
-    decode: (text) => smartDecodeText(text),
+    libs: [],
+    code: `function(text, ctx) {
+  return smartDecodeText(text);
+}`,
   },
   utf8: {
     label: "原样文本",
-    decode: (text) => (typeof text === "string" ? text : String(text ?? "")),
-    encode: (value) => (typeof value === "string" ? value : JSON.stringify(value)),
+    libs: [],
+    code: `function(text, ctx) {
+  return typeof text === "string" ? text : String(text == null ? "" : text);
+}`,
+    encode: `function(value, ctx) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}`,
   },
   json: {
     label: "JSON 解析",
-    decode: (text) => { try { return JSON.parse(String(text)); } catch { return String(text); } },
-    encode: (value) => JSON.stringify(value),
+    libs: [],
+    code: `function(text, ctx) {
+  try { return JSON.parse(String(text)); } catch { return String(text); }
+}`,
+    encode: `function(value, ctx) {
+  return JSON.stringify(value);
+}`,
   },
   form: {
     label: "form-urlencoded 解析",
-    decode: (text) => {
-      const t = String(text ?? "");
-      if (!t) return t;
-      const out = {};
-      try {
-        new URLSearchParams(t).forEach((value, name) => {
-          const parsed = smartDecodeValue(value);
-          if (Object.prototype.hasOwnProperty.call(out, name)) {
-            if (!Array.isArray(out[name])) out[name] = [out[name]];
-            out[name].push(parsed);
-          } else out[name] = parsed;
-        });
-      } catch { return t; }
-      return out;
-    },
-    encode: (value) => {
-      if (!isPlainObject(value)) return String(value);
-      const parts = [];
-      for (const [k, v] of Object.entries(value)) {
-        const arr = Array.isArray(v) ? v : [v];
-        for (const vv of arr) {
-          const s = typeof vv === "string" ? vv : JSON.stringify(vv);
-          parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(s)}`);
-        }
-      }
-      return parts.join("&");
-    },
+    libs: [],
+    code: `function(text, ctx) {
+  const t = String(text == null ? "" : text);
+  if (!t) return t;
+  const out = {};
+  new URLSearchParams(t).forEach((value, name) => {
+    const parsed = smartDecodeValue(value);
+    if (Object.prototype.hasOwnProperty.call(out, name)) {
+      if (!Array.isArray(out[name])) out[name] = [out[name]];
+      out[name].push(parsed);
+    } else out[name] = parsed;
+  });
+  return out;
+}`,
+    encode: `function(value, ctx) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return String(value);
+  const parts = [];
+  for (const [k, v] of Object.entries(value)) {
+    const arr = Array.isArray(v) ? v : [v];
+    for (const vv of arr) {
+      const s = typeof vv === "string" ? vv : JSON.stringify(vv);
+      parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(s));
+    }
+  }
+  return parts.join("&");
+}`,
   },
   base64: {
     label: "Base64 解码（文本）",
-    decode: (text) => { try { return atob(String(text).trim()); } catch { return String(text); } },
-    encode: (value) => btoa(typeof value === "string" ? value : JSON.stringify(value)),
+    libs: [],
+    code: `function(text, ctx) {
+  try { return atob(String(text).trim()); } catch { return String(text); }
+}`,
+    encode: `function(value, ctx) {
+  return btoa(typeof value === "string" ? value : JSON.stringify(value));
+}`,
   },
   base64Json: {
     label: "Base64 解码 + JSON 解析",
-    decode: (text) => JSON.parse(atob(String(text).trim())),
-    encode: (value) => btoa(JSON.stringify(value)),
+    libs: [],
+    code: `function(text, ctx) {
+  return JSON.parse(atob(String(text).trim()));
+}`,
+    encode: `function(value, ctx) {
+  return btoa(JSON.stringify(value));
+}`,
   },
   gzip: {
     label: "gzip 解压（输入 base64）",
-    decode: (text) => JSON.parse(new TextDecoder("utf-8").decode(pako.ungzip(base64ToBytes(String(text))))),
-    encode: (value) => {
-      const s = typeof value === "string" ? value : JSON.stringify(value);
-      return bytesToBase64Str(pako.gzip(new TextEncoder().encode(s)));
-    },
+    libs: [],
+    code: `function(text, ctx) {
+  return JSON.parse(new TextDecoder("utf-8").decode(pako.ungzip(base64ToBytes(String(text)))));
+}`,
+    encode: `function(value, ctx) {
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return bytesToBase64Str(pako.gzip(new TextEncoder().encode(s)));
+}`,
   },
   inflate: {
     label: "zlib inflate（输入 base64）",
-    decode: (text) => JSON.parse(new TextDecoder("utf-8").decode(pako.inflate(base64ToBytes(String(text))))),
-    encode: (value) => {
-      const s = typeof value === "string" ? value : JSON.stringify(value);
-      return bytesToBase64Str(pako.deflate(new TextEncoder().encode(s)));
-    },
+    libs: [],
+    code: `function(text, ctx) {
+  return JSON.parse(new TextDecoder("utf-8").decode(pako.inflate(base64ToBytes(String(text)))));
+}`,
+    encode: `function(value, ctx) {
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return bytesToBase64Str(pako.deflate(new TextEncoder().encode(s)));
+}`,
   },
   gzipFix: {
     label: "gzip 头修复 + 解压（输入 base64，jiem）",
-    decode: (text) => {
-      const t = base64ToBytes(String(text));
-      if (t.length < 8) throw new Error("长度 < 8");
-      t[0] = 0x1f; t[1] = 0x8b; t[2] = 0x08; t[3] = 0x00;
-      t[4] = 0x00; t[5] = 0x00; t[6] = 0x00; t[7] = 0x00;
-      return JSON.parse(new TextDecoder("utf-8").decode(pako.ungzip(t)));
-    },
-    encode: (value) => {
-      const s = typeof value === "string" ? value : JSON.stringify(value);
-      return bytesToBase64Str(pako.gzip(new TextEncoder().encode(s)));
-    },
+    libs: [],
+    code: `function(text, ctx) {
+  const t = base64ToBytes(String(text));
+  if (t.length < 8) throw new Error("长度 < 8");
+  t[0] = 0x1f; t[1] = 0x8b; t[2] = 0x08; t[3] = 0x00;
+  t[4] = 0x00; t[5] = 0x00; t[6] = 0x00; t[7] = 0x00;
+  return JSON.parse(new TextDecoder("utf-8").decode(pako.ungzip(t)));
+}`,
+    encode: `function(value, ctx) {
+  const s = typeof value === "string" ? value : JSON.stringify(value);
+  return bytesToBase64Str(pako.gzip(new TextEncoder().encode(s)));
+}`,
   },
   cookie: {
     label: "Cookie 解析",
-    decode: (text) => {
-      const t = String(text).trim();
-      if (!t) return t;
-      const out = {};
-      t.split(/;\s*/).forEach((part) => {
-        const eq = part.indexOf("=");
-        if (eq <= 0) return;
-        const k = part.slice(0, eq).trim();
-        const v = part.slice(eq + 1).trim();
-        if (!k) return;
-        out[k] = smartDecodeValue(v);
-      });
-      return Object.keys(out).length ? out : t;
-    },
-    encode: (value) => {
-      if (!isPlainObject(value)) return String(value);
-      return Object.entries(value)
-        .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
-        .join("; ");
-    },
+    libs: [],
+    code: `function(text, ctx) {
+  const t = String(text).trim();
+  if (!t) return t;
+  const out = {};
+  t.split(/;\\s*/).forEach((part) => {
+    const eq = part.indexOf("=");
+    if (eq <= 0) return;
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (!k) return;
+    out[k] = smartDecodeValue(v);
+  });
+  return Object.keys(out).length ? out : t;
+}`,
+    encode: `function(value, ctx) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return String(value);
+  return Object.entries(value)
+    .map(([k, v]) => k + "=" + (typeof v === "string" ? v : JSON.stringify(v)))
+    .join("; ");
+}`,
   },
   bearer: {
     label: "Bearer/Token/JWT 解析",
-    decode: (text) => {
-      let t = String(text).trim();
-      const m = t.match(/^(Bearer|Basic|Token|JWT)\s+(.+)$/i);
-      if (m) t = m[2].trim();
-      const parts = t.split(".");
-      if (parts.length === 3 && parts[0] && parts[1]) {
-        try {
-          const decodeB64Url = (s) => {
-            let x = s.replace(/-/g, "+").replace(/_/g, "/");
-            while (x.length % 4) x += "=";
-            const bin = atob(x);
-            const bytes = new Uint8Array(bin.length);
-            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            return new TextDecoder("utf-8").decode(bytes);
-          };
-          return {
-            header: JSON.parse(decodeB64Url(parts[0])),
-            payload: JSON.parse(decodeB64Url(parts[1])),
-            signature: parts[2],
-          };
-        } catch {}
-      }
-      return t;
-    },
-    encode: (value) => (typeof value === "string" ? value : JSON.stringify(value)),
+    libs: [],
+    code: `function(text, ctx) {
+  let t = String(text).trim();
+  const m = t.match(/^(Bearer|Basic|Token|JWT)\\s+(.+)$/i);
+  if (m) t = m[2].trim();
+  const parts = t.split(".");
+  if (parts.length === 3 && parts[0] && parts[1]) {
+    try {
+      const decodeB64Url = (s) => {
+        let x = s.replace(/-/g, "+").replace(/_/g, "/");
+        while (x.length % 4) x += "=";
+        const bin = atob(x);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new TextDecoder("utf-8").decode(bytes);
+      };
+      return {
+        header: JSON.parse(decodeB64Url(parts[0])),
+        payload: JSON.parse(decodeB64Url(parts[1])),
+        signature: parts[2],
+      };
+    } catch {}
+  }
+  return t;
+}`,
+    encode: `function(value, ctx) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}`,
   },
 };
 
 // ================================================================
-// 插件加载
+// 编译 / 库收集
 // ================================================================
-const loadedPlugins = new Set();
-const pluginGlobals = new Map();
-
-function isValidParamName(name) {
-  if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return false;
-  try { new Function(name, ""); return true; } catch { return false; }
-}
-function snapshotWindowKeys() { return new Set(Object.getOwnPropertyNames(window)); }
-function unloadPlugin(name) {
-  const keys = pluginGlobals.get(name);
-  if (keys) for (const key of keys) { try { delete window[key]; } catch {} }
-  pluginGlobals.delete(name);
-  loadedPlugins.delete(name);
-  resetLibCache();
-}
-function loadScriptViaBlob(name, content) {
-  return new Promise((resolve, reject) => {
-    const blob = new Blob([content], { type: "text/javascript" });
-    const url = URL.createObjectURL(blob);
-    const script = document.createElement("script");
-    script.src = url;
-    script.onload = () => { URL.revokeObjectURL(url); resolve(); };
-    script.onerror = () => { URL.revokeObjectURL(url); reject(new Error("脚本执行出错: " + name)); };
-    document.head.appendChild(script);
-  });
-}
-async function loadPlugins() {
-  if (!window.electronAPI?.listPlugins) return;
-  const r = await window.electronAPI.listPlugins();
-  if (!r.success) { console.warn("[HAR-Decrypt] 读取插件失败:", r.error); return; }
-  for (const file of r.files) {
-    if (loadedPlugins.has(file.name)) continue;
-    const before = snapshotWindowKeys();
-    try {
-      await loadScriptViaBlob(file.name, file.content);
-      loadedPlugins.add(file.name);
-      const set = pluginGlobals.get(file.name) || new Set();
-      for (const key of Object.getOwnPropertyNames(window)) {
-        if (!before.has(key)) set.add(key);
-      }
-      pluginGlobals.set(file.name, set);
-    } catch (e) {
-      console.error(`[HAR-Decrypt] ❌ 插件加载失败: ${file.name}`, e);
-    }
-  }
-  resetLibCache();
-}
-
 const KNOWN_GLOBALS = [
   "CryptoJS", "JSEncrypt", "BigNumber", "Big", "bignumber",
   "sm2", "sm3", "sm4", "smCrypto", "forge", "JSZip",
@@ -604,6 +764,11 @@ const KNOWN_GLOBALS = [
   "aesjs", "jsrsasign", "pako",
 ];
 let _libCache = null;
+const _compiledFns = new Map();
+const INTERNAL_HELPERS = {
+  smartDecodeText, smartDecodeValue, isJsonLike, isFormLike, tryBase64,
+  base64ToBytes, bytesToBase64Str, isPlainObject, valueToText, escapeHtml,
+};
 function collectLibs() {
   if (_libCache) return _libCache;
   const map = new Map();
@@ -611,6 +776,7 @@ function collectLibs() {
   for (const name of KNOWN_GLOBALS) {
     if (window[name] != null && !map.has(name)) map.set(name, window[name]);
   }
+  // 已懒加载的库，全局名注入
   for (const keys of pluginGlobals.values()) {
     for (const name of keys) {
       if (name === "__HAR_PLUGINS__" || map.has(name)) continue;
@@ -620,10 +786,8 @@ function collectLibs() {
       map.set(name, v);
     }
   }
-  if (window.__HAR_PLUGINS__ && typeof window.__HAR_PLUGINS__ === "object") {
-    for (const [k, v] of Object.entries(window.__HAR_PLUGINS__)) {
-      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k) && !map.has(k)) map.set(k, v);
-    }
+  for (const [k, v] of Object.entries(INTERNAL_HELPERS)) {
+    if (!map.has(k)) map.set(k, v);
   }
   _libCache = { names: [...map.keys()], values: [...map.values()] };
   return _libCache;
@@ -640,21 +804,11 @@ function compileDecoderCode(code) {
     return { fn: null, error: e.message };
   }
 }
-
-// ================================================================
-// 配置数据
-// ================================================================
-let fileDecoders = {};
-let fileRules = [];
-const _compiledFns = new Map();
-
-function getCompiledCustom(id) {
-  const c = fileDecoders[id];
-  if (!c) return null;
-  const encodeCode = c.encode || "";
+function getCompiled(id, d) {
+  const encodeCode = d.encode || "";
   const cached = _compiledFns.get(id);
-  if (cached && cached.code === c.code && cached.encodeCode === encodeCode) return cached;
-  const result = { code: c.code, ...compileDecoderCode(c.code) };
+  if (cached && cached.code === d.code && cached.encodeCode === encodeCode) return cached;
+  const result = { code: d.code, ...compileDecoderCode(d.code) };
   result.encodeCode = encodeCode;
   if (encodeCode) {
     const encoded = compileDecoderCode(encodeCode);
@@ -664,6 +818,10 @@ function getCompiledCustom(id) {
   _compiledFns.set(id, result);
   return result;
 }
+
+// ================================================================
+// 规则归一化
+// ================================================================
 function normalizeFieldTree(node) {
   if (!node || typeof node !== "object") return null;
   const param = node.param || node.pathField || node.jsonPath || "";
@@ -724,73 +882,83 @@ function buildMethodsFromLegacy(jsonFieldRules) {
   return out;
 }
 
-function refreshFileData() {
-  fileDecoders = {};
-  fileRules = [];
-  if (window.HAR_DECODERS && typeof window.HAR_DECODERS === "object") {
-    for (const [id, d] of Object.entries(window.HAR_DECODERS)) {
-      if (BUILTIN_DECODERS[id]) continue;
-      if (!d || typeof d.code !== "string") continue;
-      fileDecoders[id] = {
-        label: d.label || id, code: d.code,
-        encode: typeof d.encode === "string" ? d.encode : "",
-        requires: Array.isArray(d.requires) ? d.requires : [],
-        cdn: d.cdn || [],
-      };
-    }
+function refreshConfig() {
+  userDecoders = loadJSON(LS_KEYS.userDecoders, {});
+  userTemplates = loadJSON(LS_KEYS.templates, {});
+  for (const [id, d] of Object.entries(userDecoders)) {
+    if (!Array.isArray(d.libs)) d.libs = [];
   }
-  if (Array.isArray(window.HAR_RULES)) {
-    const seenDomains = new Map();
-    for (const r of window.HAR_RULES) {
-      if (!r || !r.pattern) continue;
-      const isHostRule = r.matchHost !== false && !r.isRegex;
-      let methods = {};
-      if (r.methods && typeof r.methods === "object" && !Array.isArray(r.methods)) {
-        methods = normalizeMethodsMap(r.methods);
-      } else if (Array.isArray(r.jsonFieldRules)) {
-        methods = buildMethodsFromLegacy(r.jsonFieldRules);
-      }
-      // 关键：新增 paramsDecoder，旧规则没有时 fallback 到 reqDecoder
-      const reqDecoder = r.reqDecoder || "raw";
-      const paramsDecoder = r.paramsDecoder || reqDecoder;
-      const rule = {
-        pattern: String(r.pattern), isRegex: !!r.isRegex, matchHost: isHostRule,
-        reqDecoder,
-        paramsDecoder,
-        resDecoder: r.resDecoder || "raw",
-        keys: r.keys || null,
-        reqHeaderDecoders:
-          r.reqHeaderDecoders && typeof r.reqHeaderDecoders === "object" && !Array.isArray(r.reqHeaderDecoders)
-            ? r.reqHeaderDecoders : null,
-        methods,
-      };
-      if (isHostRule) {
-        const key = rule.pattern.toLowerCase();
-        if (seenDomains.has(key)) {
-          const idx = seenDomains.get(key);
-          const prev = fileRules[idx];
-          const merged = { ...prev, ...rule, methods: { ...prev.methods } };
-          for (const [m, arr] of Object.entries(rule.methods)) merged.methods[m] = arr;
-          fileRules[idx] = merged;
-        } else {
-          seenDomains.set(key, fileRules.length);
-          fileRules.push(rule);
-        }
+  const rulesRaw = loadJSON(LS_KEYS.rules, []);
+  fileRules = [];
+  const seenDomains = new Map();
+  for (const r of (Array.isArray(rulesRaw) ? rulesRaw : [])) {
+    if (!r || !r.pattern) continue;
+    const isHostRule = r.matchHost !== false && !r.isRegex;
+    let methods = {};
+    if (r.methods && typeof r.methods === "object" && !Array.isArray(r.methods)) {
+      methods = normalizeMethodsMap(r.methods);
+    } else if (Array.isArray(r.jsonFieldRules)) {
+      methods = buildMethodsFromLegacy(r.jsonFieldRules);
+    }
+    const reqDecoder = r.reqDecoder || "raw";
+    const paramsDecoder = r.paramsDecoder || reqDecoder;
+    const rule = {
+      pattern: String(r.pattern), isRegex: !!r.isRegex, matchHost: isHostRule,
+      reqDecoder, paramsDecoder,
+      resDecoder: r.resDecoder || "raw",
+      keys: r.keys || null,
+      reqHeaderDecoders:
+        r.reqHeaderDecoders && typeof r.reqHeaderDecoders === "object" && !Array.isArray(r.reqHeaderDecoders)
+          ? r.reqHeaderDecoders : null,
+      methods,
+    };
+    if (isHostRule) {
+      const key = rule.pattern.toLowerCase();
+      if (seenDomains.has(key)) {
+        const idx = seenDomains.get(key);
+        const prev = fileRules[idx];
+        const merged = { ...prev, ...rule, methods: { ...prev.methods } };
+        for (const [m, arr] of Object.entries(rule.methods)) merged.methods[m] = arr;
+        fileRules[idx] = merged;
       } else {
+        seenDomains.set(key, fileRules.length);
         fileRules.push(rule);
       }
-    }
+    } else fileRules.push(rule);
   }
   _compiledFns.clear();
 }
+function reloadConfig() {
+  refreshConfig();
+  renderDecoderList();
+  fillTemplateSelect();
+  if (state.har) rebuildEntryList();
+}
+
+// ================================================================
+// 算法列表 / 规则匹配
+// ================================================================
 function getAllDecoders() {
-  const all = { ...BUILTIN_DECODERS };
-  for (const [id, d] of Object.entries(fileDecoders)) {
-    const comp = getCompiledCustom(id);
+  const all = {};
+  for (const [id, d] of Object.entries(BUILTIN_DECODERS)) {
+    if (userDecoders[id]) continue;
+    const comp = getCompiled("builtin:" + id, d);
     all[id] = {
-      label: d.label, encodeCode: comp.encodeCode, requires: d.requires || [],
+      label: d.label, encodeCode: d.encode || "", requires: [],
+      libs: Array.isArray(d.libs) ? d.libs : [],
       decode: comp.fn ? async (text, ctx) => comp.fn(text, ctx) : () => { throw new Error("编译失败: " + comp.error); },
       encode: comp.encodeFn ? async (value, ctx) => comp.encodeFn(value, ctx) : null,
+      isBuiltin: true, overridden: false,
+    };
+  }
+  for (const [id, d] of Object.entries(userDecoders)) {
+    const comp = getCompiled(id, d);
+    all[id] = {
+      label: d.label, encodeCode: comp.encodeCode, requires: d.requires || [],
+      libs: Array.isArray(d.libs) ? d.libs : [],
+      decode: comp.fn ? async (text, ctx) => comp.fn(text, ctx) : () => { throw new Error("编译失败: " + comp.error); },
+      encode: comp.encodeFn ? async (value, ctx) => comp.encodeFn(value, ctx) : null,
+      isBuiltin: !!BUILTIN_DECODERS[id], overridden: !!BUILTIN_DECODERS[id],
     };
   }
   return all;
@@ -837,100 +1005,58 @@ function collectMatchedFields(domainRule, method, urlPath, target) {
 }
 
 // ================================================================
-// 配置读写
+// 首次 seed
 // ================================================================
-async function reloadFiles() {
-  try {
-    const [r1, r2] = await Promise.all([
-      window.electronAPI.readConfig("decoders"),
-      window.electronAPI.readConfig("rules"),
-    ]);
-    window.HAR_DECODERS = (r1.success && r1.data?.HAR_DECODERS) || {};
-    window.HAR_TEMPLATES = (r1.success && r1.data?.HAR_TEMPLATES) || {};
-    window.HAR_RULES = (r2.success && r2.data?.HAR_RULES) || [];
-    if (!r2.success) {
-      try {
-        await window.electronAPI.writeConfig("rules",
-          "// HAR 域名规则配置（应用自动生成）\nwindow.HAR_RULES = [];\n");
-      } catch (e) { console.error("[HAR-Decrypt] 自动修复失败:", e); }
+function seedFromScriptsIfNeeded() {
+  if (localStorage.getItem(LS_KEYS.seeded) === "1") return;
+  if (window.HAR_DECODERS && typeof window.HAR_DECODERS === "object") {
+    const cur = loadJSON(LS_KEYS.userDecoders, {});
+    let n = 0;
+    for (const [id, d] of Object.entries(window.HAR_DECODERS)) {
+      if (!d || typeof d.code !== "string") continue;
+      if (cur[id]) continue;
+      cur[id] = {
+        label: d.label || id,
+        code: d.code,
+        encode: typeof d.encode === "string" ? d.encode : "",
+        libs: Array.isArray(d.libs) ? d.libs : [],
+        cdn: d.cdn || [],
+      };
+      n++;
     }
-    refreshFileData();
-    renderDecoderList();
-    fillTemplateSelect();
-    if (state.har) rebuildEntryList();
-  } catch (e) { showToast("重载失败: " + e.message, "err"); }
+    if (n) saveJSON(LS_KEYS.userDecoders, cur);
+  }
+  if (Array.isArray(window.HAR_RULES) && !localStorage.getItem(LS_KEYS.rules)) {
+    saveJSON(LS_KEYS.rules, window.HAR_RULES);
+  }
+  if (window.HAR_TEMPLATES && typeof window.HAR_TEMPLATES === "object" && !localStorage.getItem(LS_KEYS.templates)) {
+    saveJSON(LS_KEYS.templates, window.HAR_TEMPLATES);
+  }
+  localStorage.setItem(LS_KEYS.seeded, "1");
 }
-async function rewriteDecodersFile() {
-  const rd = await window.electronAPI.readConfig("decoders");
-  const oldText = rd.content || "";
-  const oldLines = oldText.split("\n");
-  let cutLine = oldLines.length;
-  for (let i = 0; i < oldLines.length; i++) {
-    if (/window\.HAR_DECODERS\s*=/.test(oldLines[i]) || /Object\.assign\(\s*window\.HAR_DECODERS/.test(oldLines[i])) {
-      cutLine = i; break;
-    }
-  }
-  const head = oldLines.slice(0, cutLine).join("\n").trimEnd();
-  const esc = (s) => String(s || "").replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
-  const decLines = ["window.HAR_DECODERS = {"];
-  for (const id of Object.keys(fileDecoders)) {
-    const d = fileDecoders[id];
-    decLines.push(`  ${id}: {`);
-    decLines.push(`    label: ${JSON.stringify(d.label)},`);
-    decLines.push(`    cdn: ${JSON.stringify(d.cdn || [])},`);
-    decLines.push(`    code: \`${esc(d.code)}\``);
-    if (d.encode) decLines.push(`    encode: \`${esc(d.encode)}\`,`);
-    decLines.push(`  },`);
-  }
-  decLines.push("};");
-  const newText = (head ? head + "\n\n" : "") + decLines.join("\n") + "\n";
-  const w = await window.electronAPI.writeConfig("decoders", newText);
-  if (!w.success) throw new Error(w.error);
+function reseedFromScripts() {
+  if (!confirm("清空当前所有自定义算法/规则/模板，重新从 decoders.js / rules.js 导入？\n（IndexedDB 里的库不受影响）")) return;
+  localStorage.removeItem(LS_KEYS.seeded);
+  localStorage.removeItem(LS_KEYS.userDecoders);
+  localStorage.removeItem(LS_KEYS.rules);
+  localStorage.removeItem(LS_KEYS.templates);
+  seedFromScriptsIfNeeded();
+  reloadConfig();
+  showToast("已重新导入", "ok");
 }
-async function rewriteRulesFile() {
-  const rd = await window.electronAPI.readConfig("rules");
-  const oldText = rd.content || "";
-  const oldLines = oldText.split("\n");
-  let cutLine = oldLines.length;
-  for (let i = 0; i < oldLines.length; i++) {
-    if (/window\.HAR_RULES/.test(oldLines[i])) { cutLine = i; break; }
-  }
-  const head = oldLines.slice(0, cutLine).join("\n").trimEnd();
-  function cleanField(f) {
-    const o = { param: f.param, decoderId: f.decoderId || "raw", fields: [] };
-    if (f.fields?.length) o.fields = f.fields.map(cleanField);
-    return o;
-  }
-  const output = fileRules.map((r) => {
-    const out = {
-      pattern: r.pattern, isRegex: !!r.isRegex, matchHost: !!r.matchHost,
-      reqDecoder: r.reqDecoder || "raw",
-      paramsDecoder: r.paramsDecoder || "raw",
-      resDecoder: r.resDecoder || "raw",
-    };
-    if (r.keys && typeof r.keys === "object" && !Array.isArray(r.keys)) out.keys = r.keys;
-    if (r.reqHeaderDecoders && typeof r.reqHeaderDecoders === "object" && !Array.isArray(r.reqHeaderDecoders))
-      out.reqHeaderDecoders = r.reqHeaderDecoders;
-    if (r.methods && Object.keys(r.methods).length) {
-      out.methods = {};
-      for (const [m, arr] of Object.entries(r.methods)) {
-        if (!arr || !arr.length) continue;
-        out.methods[m] = arr.map((p) => ({
-          path: p.path || "", target: p.target || "body",
-          fields: (p.fields || []).map(cleanField),
-        }));
-      }
-    }
-    return out;
-  });
-  const body = "window.HAR_RULES = " + JSON.stringify(output, null, 2) + ";";
-  const newText = (head ? head + "\n\n" : "") + body + "\n";
-  const w = await window.electronAPI.writeConfig("rules", newText);
-  if (!w.success) throw new Error(w.error);
+function resetAllConfig() {
+  if (!confirm("清空所有自定义算法、规则、模板（库不受影响）。继续？")) return;
+  localStorage.removeItem(LS_KEYS.userDecoders);
+  localStorage.removeItem(LS_KEYS.rules);
+  localStorage.removeItem(LS_KEYS.templates);
+  localStorage.removeItem(LS_KEYS.seeded);
+  refreshConfig();
+  reloadConfig();
+  showToast("已重置", "ok");
 }
 
 // ================================================================
-// 状态
+// 状态 / DOM 引用
 // ================================================================
 const PAGE_SIZE = 300;
 const MAX_AUTO_DECRYPT = 5 * 1024 * 1024;
@@ -1079,6 +1205,7 @@ document.addEventListener("dragover", (e) => { if (!hasFiles(e)) return; e.preve
 document.addEventListener("dragleave", (e) => { if (!hasFiles(e)) return; e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; hideDragOverlay(); } });
 document.addEventListener("drop", async (e) => {
   if (!hasFiles(e)) return;
+  if (e.target.closest?.("#libDropZone, #libCodeInput")) return;
   e.preventDefault(); dragCounter = 0; hideDragOverlay();
   const file = e.dataTransfer.files?.[0];
   if (!file) return;
@@ -1561,10 +1688,10 @@ function renderHeaderError(container, error) {
 }
 
 // ================================================================
-// 解密 / 加密执行
+// 解密 / 加密执行（含懒加载）
 // ================================================================
 function getRequiredCryptoFields(id) {
-  const definition = fileDecoders[id] || BUILTIN_DECODERS[id];
+  const definition = userDecoders[id] || BUILTIN_DECODERS[id];
   if (definition?.requires?.length) return definition.requires;
   const code = definition?.code || "";
   return ["key", "iv", "offset"].filter((field) =>
@@ -1673,13 +1800,29 @@ async function getDecoderContext(id, ctx = {}) {
   if (ds) ds.cryptoKeys[id] = { ...context.keys };
   return context;
 }
+
 async function runDecoder(id, text, ctx) {
-  const d = getAllDecoders()[id];
+  let d = getAllDecoders()[id];
   if (!d) throw new Error("未知解码方式: " + id);
+  if (d.libs?.length) {
+    const missing = d.libs.filter((n) => !loadedLibs.has(n));
+    if (missing.length) {
+      await ensureLibsLoaded(missing);
+      d = getAllDecoders()[id];
+    }
+  }
   return await d.decode(String(text ?? ""), await getDecoderContext(id, ctx));
 }
 async function runEncoder(id, value, ctx) {
-  const d = getAllDecoders()[id];
+  let d = getAllDecoders()[id];
+  if (!d) throw new Error("未知解码方式: " + id);
+  if (d.libs?.length) {
+    const missing = d.libs.filter((n) => !loadedLibs.has(n));
+    if (missing.length) {
+      await ensureLibsLoaded(missing);
+      d = getAllDecoders()[id];
+    }
+  }
   if (!d?.encode) throw new Error(`「${d?.label || id}」没有配对加密函数`);
   return await d.encode(value, await getDecoderContext(id, ctx));
 }
@@ -1689,7 +1832,6 @@ async function runDecryptForItem(item, ds, { skipBodies = false } = {}) {
   const ctx = { rule, keys: rule?.keys || {}, requestIndex: item.originalIndex };
   const jobs = [];
 
-  // query 参数：使用 paramsDecoder（fallback 到 reqDecoder 兼容旧规则）
   const queryText = getQueryRawText(entry);
   if (queryText) {
     const qid = ds.queryDecoder || rule?.paramsDecoder || rule?.reqDecoder || "raw";
@@ -1702,7 +1844,6 @@ async function runDecryptForItem(item, ds, { skipBodies = false } = {}) {
     })());
   }
 
-  // 请求体：reqDecoder
   const postText = getPostText(entry);
   if (postText && !skipBodies) {
     const reqId = ds.reqDecoder || rule?.reqDecoder || "raw";
@@ -1718,7 +1859,6 @@ async function runDecryptForItem(item, ds, { skipBodies = false } = {}) {
     }
   }
 
-  // 响应体：resDecoder
   const resText = getResponseText(entry);
   if (resText && !skipBodies) {
     const resId = ds.resDecoder || rule?.resDecoder || "raw";
@@ -1820,7 +1960,6 @@ function buildQuerySection({ entry, item, rule, urlPath, ctx }) {
       try { ds.queryResult = await runDecoder(id, rawText, ctx); }
       catch (e) { ds.queryResult = null; ds.queryError = e.message || String(e); }
       ds.queryLoading = false;
-      // 不清空字段规则
       renderDetail();
       renderList();
     },
@@ -2035,7 +2174,7 @@ function buildJsonFieldNode({ node, source, ctx, onRemove, level = 0 }) {
 }
 
 // ================================================================
-// 加密对照 / 导出
+// 加密对照 / 导出算法 / 备份
 // ================================================================
 function showCompareResult(container, match, originalText, encodedText) {
   const w = document.createElement("div");
@@ -2061,27 +2200,104 @@ function showCompareResult(container, match, originalText, encodedText) {
   w.appendChild(encPre);
   container.appendChild(w);
 }
-function exportEncoderCode(decoderId) {
-  const def = fileDecoders[decoderId];
-  if (!def?.encode) throw new Error("没有可导出的加密函数");
-  const esc = (s) => String(s || "").replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
-  const code = [
-    `// 自动导出：${def.label}（${decoderId}）`,
-    `// 解密：async function(text, ctx) -> 值`,
-    `// 加密：async function(value, ctx) -> 字符串`,
-    `window.HAR_ENCODERS = window.HAR_ENCODERS || {};`,
-    `window.HAR_ENCODERS[${JSON.stringify(decoderId)}] = {`,
-    `  label: ${JSON.stringify(def.label)},`,
-    `  decode: \`${esc(def.code)}\`,`,
-    `  encode: \`${esc(def.encode)}\`,`,
-    `};`, "",
-  ].join("\n");
-  const blob = new Blob([code], { type: "application/javascript" });
+
+const _EXPORT_PRELUDE = `// ===== 内置依赖（导出后独立运行）=====
+function isJsonLike(s) { const t = s.trim(); return (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]")); }
+function isFormLike(s) { const t = s.trim(); if (!t.includes("=") || t.startsWith("{") || t.startsWith("[")) return false; return /^[^=&]+=[^&]*(?:&[^=&]+=[^&]*)*$/.test(t); }
+function tryBase64(s) { if (typeof s !== "string") return null; if (s.length < 8 || s.length % 4 !== 0) return null; if (!/^[A-Za-z0-9+/]+={0,2}$/.test(s)) return null; try { const bin = atob(s); const b = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i); const t = new TextDecoder("utf-8", { fatal: true }).decode(b); if (/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]/.test(t)) return null; return t; } catch { return null; } }
+function smartDecodeValue(v, d) { d = d || 0; if (d > 6) return v; if (v == null || typeof v !== "object") { if (typeof v !== "string") return v; let c = v; if (/%[0-9A-Fa-f]{2}/.test(c)) { try { const r = decodeURIComponent(c); if (r !== c) c = r; } catch {} } const b = tryBase64(c); if (b !== null) c = b; if (typeof c === "string" && isJsonLike(c)) { try { return smartDecodeValue(JSON.parse(c), d + 1); } catch {} } return c; } if (Array.isArray(v)) return v.map(x => smartDecodeValue(x, d + 1)); const o = {}; for (const k of Object.keys(v)) o[k] = smartDecodeValue(v[k], d + 1); return o; }
+function smartDecodeText(t) { if (t == null) return t; const s = String(t).trim(); if (!s) return s; if (isJsonLike(s)) { try { return smartDecodeValue(JSON.parse(s), 0); } catch {} } if (isFormLike(s)) { const o = {}; new URLSearchParams(s).forEach((v, n) => { const p = smartDecodeValue(v, 0); if (Object.prototype.hasOwnProperty.call(o, n)) { if (!Array.isArray(o[n])) o[n] = [o[n]]; o[n].push(p); } else o[n] = p; }); return o; } const b = tryBase64(s); if (b !== null) { const i = b.trim(); if (isJsonLike(i)) { try { return smartDecodeValue(JSON.parse(i), 0); } catch {} } if (isFormLike(i)) { const o = {}; new URLSearchParams(i).forEach((v, n) => { const p = smartDecodeValue(v, 0); if (Object.prototype.hasOwnProperty.call(o, n)) { if (!Array.isArray(o[n])) o[n] = [o[n]]; o[n].push(p); } else o[n] = p; }); return o; } return b; } if (/%[0-9A-Fa-f]{2}/.test(s)) { try { const r = decodeURIComponent(s); if (r !== s) return r; } catch {} } return s; }
+function base64ToBytes(b64) { const bin = atob(String(b64).trim()); const o = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) o[i] = bin.charCodeAt(i); return o; }
+function bytesToBase64Str(bytes) { let bin = ""; const chunk = 0x8000; for (let i = 0; i < bytes.length; i += chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk)); return btoa(bin); }
+function isPlainObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+// =====================================
+`;
+function _escTemplate(s) {
+  return String(s || "").replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
+}
+function exportAllDecodersJs() {
+  const all = getAllDecoders();
+  const ids = Object.keys(all);
+  const lines = [
+    "// ===== 全部算法导出（可直接作为 decoders.js 使用）=====",
+    `// 导出于 ${new Date().toISOString()}`,
+    "",
+    _EXPORT_PRELUDE,
+    "",
+    "window.HAR_DECODERS = {",
+  ];
+  for (const id of ids) {
+    const d = all[id];
+    const isCustom = !!userDecoders[id];
+    const src = isCustom ? userDecoders[id] : { code: BUILTIN_DECODERS[id].code, encode: BUILTIN_DECODERS[id].encode || "" };
+    lines.push(`  ${id}: {`);
+    lines.push(`    label: ${JSON.stringify(d.label)},`);
+    lines.push(`    cdn: [],`);
+    if (d.libs?.length) lines.push(`    libs: ${JSON.stringify(d.libs)},`);
+    lines.push(`    code: \`${_escTemplate(src.code)}\`,`);
+    if (src.encode) lines.push(`    encode: \`${_escTemplate(src.encode)}\`,`);
+    lines.push(`  },`);
+  }
+  lines.push("};");
+  lines.push("");
+  const blob = new Blob([lines.join("\n")], { type: "application/javascript" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `encoder-${decoderId}.js`;
+  a.download = `decoders-all-${Date.now()}.js`;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+function exportSingleDecoderJs(id) {
+  const all = getAllDecoders();
+  const d = all[id];
+  if (!d) throw new Error("算法不存在: " + id);
+  const isCustom = !!userDecoders[id];
+  const src = isCustom ? userDecoders[id] : { code: BUILTIN_DECODERS[id].code, encode: BUILTIN_DECODERS[id].encode || "" };
+  const lines = [
+    `// 单独导出：${d.label}（${id}）`,
+    `window.HAR_DECODERS = window.HAR_DECODERS || {};`,
+    `window.HAR_DECODERS[${JSON.stringify(id)}] = {`,
+    `  label: ${JSON.stringify(d.label)},`,
+    `  cdn: [],`,
+  ];
+  if (d.libs?.length) lines.push(`  libs: ${JSON.stringify(d.libs)},`);
+  lines.push(`  code: \`${_escTemplate(src.code)}\`,`);
+  if (src.encode) lines.push(`  encode: \`${_escTemplate(src.encode)}\`,`);
+  lines.push("};", "");
+  const blob = new Blob([lines.join("\n")], { type: "application/javascript" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `decoder-${id}-${Date.now()}.js`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function exportBackupJson() {
+  const data = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    userDecoders,
+    rules: fileRules,
+    templates: userTemplates,
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `har-decrypt-backup-${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function importBackupJson(file) {
+  file.text().then((text) => {
+    let data;
+    try { data = JSON.parse(text); } catch (e) { showToast("JSON 解析失败: " + e.message, "err"); return; }
+    if (!data || typeof data !== "object") { showToast("文件格式无效", "err"); return; }
+    if (!confirm("将覆盖当前的算法、规则和模板。继续？")) return;
+    if (data.userDecoders && typeof data.userDecoders === "object") saveJSON(LS_KEYS.userDecoders, data.userDecoders);
+    if (Array.isArray(data.rules)) saveJSON(LS_KEYS.rules, data.rules);
+    if (data.templates && typeof data.templates === "object") saveJSON(LS_KEYS.templates, data.templates);
+    reloadConfig();
+    showToast("已导入备份", "ok");
+  }).catch((e) => showToast("读取失败: " + e.message, "err"));
 }
 
 // ================================================================
@@ -2146,7 +2362,6 @@ function renderDetail() {
       ctx,
       onDecrypt: async (id) => {
         ds.reqDecoder = id;
-        // 不清空字段规则
         try { ds.reqResult = await runDecoder(id, reqText, ctx); ds.reqError = null; }
         catch (err) { ds.reqResult = null; ds.reqError = err.message || String(err); }
         renderDetail();
@@ -2220,14 +2435,12 @@ async function generateRuleFromCurrent(item) {
   if (existingIndex >= 0) {
     rule = JSON.parse(JSON.stringify(fileRules[existingIndex]));
     rule.reqDecoder = ds.reqDecoder || rule.reqDecoder || "raw";
-    // 新增：paramsDecoder 独立保存
     rule.paramsDecoder = ds.queryDecoder || rule.paramsDecoder || rule.reqDecoder || "raw";
     rule.resDecoder = ds.resDecoder || rule.resDecoder || "raw";
   } else {
     rule = {
       pattern: url.hostname, isRegex: false, matchHost: true,
       reqDecoder: ds.reqDecoder || "raw",
-      // 新增：新规则也带 paramsDecoder
       paramsDecoder: ds.queryDecoder || "raw",
       resDecoder: ds.resDecoder || "raw",
       methods: {},
@@ -2262,29 +2475,23 @@ async function generateRuleFromCurrent(item) {
   if (existingIndex >= 0) fileRules[existingIndex] = rule;
   else fileRules.push(rule);
 
-  try {
-    await rewriteRulesFile();
-    // Bug 1 修复：不依赖 reloadFiles 读回（避免缓存/时序问题），
-    // 直接用内存同步到 window.HAR_RULES 并重建索引
-    window.HAR_RULES = JSON.parse(JSON.stringify(fileRules));
-    refreshFileData();
-    for (const d of state.decryptState.values()) d.fieldDecodes = {};
-    if (state.har) {
-      rebuildEntryList();
-      if (state.currentIndex >= 0) renderDetail();
-    }
-    showToast(
-      existingIndex >= 0
-        ? `已更新 ${hostname} 的 ${method}${usedPath ? ` ${usedPath}` : "（整个域名）"} 规则`
-        : `已生成域名规则：${hostname}${usedPath ? ` ${usedPath}` : "（整个域名）"}`,
-      "ok",
-    );
-  } catch (error) {
+  if (!saveJSON(LS_KEYS.rules, fileRules)) {
     fileRules = previous;
-    window.HAR_RULES = JSON.parse(JSON.stringify(previous));
-    refreshFileData();
-    throw error;
+    refreshConfig();
+    throw new Error("localStorage 写入失败");
   }
+  refreshConfig();
+  for (const d of state.decryptState.values()) d.fieldDecodes = {};
+  if (state.har) {
+    rebuildEntryList();
+    if (state.currentIndex >= 0) renderDetail();
+  }
+  showToast(
+    existingIndex >= 0
+      ? `已更新 ${hostname} 的 ${method}${usedPath ? ` ${usedPath}` : "（整个域名）"} 规则`
+      : `已生成域名规则：${hostname}${usedPath ? ` ${usedPath}` : "（整个域名）"}`,
+    "ok",
+  );
 }
 
 function buildDetailTabs({ item, requestBody, headers, originalIndex, rule, responseBody, requestTabLabel = "请求体" }) {
@@ -2421,18 +2628,6 @@ function buildBodySection({
       }
     });
     tb.appendChild(compareBtn);
-    if (fileDecoders[decoderId]?.encode) {
-      const exportBtn2 = document.createElement("button");
-      exportBtn2.type = "button";
-      exportBtn2.className = "btn-secondary";
-      exportBtn2.textContent = "📤 导出加密函数";
-      exportBtn2.title = "下载该算法的解密+加密函数代码";
-      exportBtn2.addEventListener("click", () => {
-        try { exportEncoderCode(decoderId); showToast("已导出加密函数", "ok"); }
-        catch (e) { showToast(e.message, "err"); }
-      });
-      tb.appendChild(exportBtn2);
-    }
   }
 
   w.appendChild(tb);
@@ -2479,7 +2674,9 @@ function buildEmptySection(title, text) {
   return w;
 }
 
-// 批量解密
+// ================================================================
+// 批量解密 / 导出 HAR
+// ================================================================
 autoAllBtn.addEventListener("click", async () => {
   if (!state.har) return;
   autoAllBtn.disabled = true;
@@ -2501,8 +2698,6 @@ autoAllBtn.addEventListener("click", async () => {
   autoAllBtn.disabled = false;
   alert(`命中规则 ${total} 条，已处理完成。`);
 });
-
-// 导出
 function applyDecryptToHar(harObj) {
   let count = 0;
   for (const [origIdx, ds] of state.decryptState) {
@@ -2566,10 +2761,8 @@ function openModal() {
   configModal.style.display = "flex";
   switchTab("decoders");
   renderDecoderList();
-  renderPluginList();
   hideDecoderForm();
   fillTemplateSelect();
-  updatePluginsDirLabel();
 }
 function closeModal() { configModal.style.display = "none"; }
 $("configBtn").addEventListener("click", openModal);
@@ -2579,93 +2772,185 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
   if (configModal.style.display === "flex") closeModal();
 });
-async function updatePluginsDirLabel() {
-  try {
-    const r = await window.electronAPI.listPlugins();
-    $("pluginsDirPath").textContent = r.dir;
-  } catch (e) {}
-}
-$("openPluginsDirBtn").addEventListener("click", () => window.electronAPI.openPluginsDir());
 document.querySelectorAll(".modal-tab").forEach((tab) => {
   tab.addEventListener("click", () => switchTab(tab.dataset.tab));
 });
 function switchTab(name) {
   document.querySelectorAll(".modal-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
   document.querySelectorAll(".tab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
-  if (name === "plugins") renderPluginList();
+  if (name === "libs") renderLibList();
 }
-$("reloadPluginsBtn").addEventListener("click", async () => {
-  loadedPlugins.clear();
-  await loadPlugins();
-  await reloadFiles();
-  renderPluginList();
-  showToast("插件已重新加载", "ok");
-});
 
+// -------- 算法列表 UI --------
 function renderDecoderList() {
   decoderList.innerHTML = "";
-  const fileIds = Object.keys(fileDecoders);
-  if (!fileIds.length) {
+  const toolbar = document.createElement("div");
+  toolbar.style.cssText = "display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;";
+
+  const exportAllJsBtn = document.createElement("button");
+  exportAllJsBtn.className = "btn-secondary";
+  exportAllJsBtn.style.fontSize = "12px";
+  exportAllJsBtn.textContent = "📦 导出全部算法 (.js)";
+  exportAllJsBtn.addEventListener("click", () => {
+    try { exportAllDecodersJs(); showToast("已导出", "ok"); }
+    catch (e) { showToast("导出失败: " + e.message, "err"); }
+  });
+  toolbar.appendChild(exportAllJsBtn);
+
+  const exportBackupBtn = document.createElement("button");
+  exportBackupBtn.className = "btn-secondary";
+  exportBackupBtn.style.fontSize = "12px";
+  exportBackupBtn.textContent = "💾 备份 (json)";
+  exportBackupBtn.addEventListener("click", () => {
+    try { exportBackupJson(); showToast("已导出备份", "ok"); }
+    catch (e) { showToast("导出失败: " + e.message, "err"); }
+  });
+  toolbar.appendChild(exportBackupBtn);
+
+  const importBtn = document.createElement("button");
+  importBtn.className = "btn-secondary";
+  importBtn.style.fontSize = "12px";
+  importBtn.textContent = "📥 导入备份";
+  const importInput = document.createElement("input");
+  importInput.type = "file"; importInput.accept = ".json,application/json"; importInput.style.display = "none";
+  importInput.addEventListener("change", (e) => {
+    const f = e.target.files?.[0];
+    if (f) importBackupJson(f);
+    e.target.value = "";
+  });
+  importBtn.addEventListener("click", () => importInput.click());
+  toolbar.appendChild(importBtn);
+  toolbar.appendChild(importInput);
+
+  const reseedBtn = document.createElement("button");
+  reseedBtn.className = "btn-secondary";
+  reseedBtn.style.fontSize = "12px";
+  reseedBtn.textContent = "🔄 从脚本重新导入";
+  reseedBtn.addEventListener("click", reseedFromScripts);
+  toolbar.appendChild(reseedBtn);
+
+  const resetBtn = document.createElement("button");
+  resetBtn.className = "btn-secondary";
+  resetBtn.style.fontSize = "12px";
+  resetBtn.style.borderColor = "rgba(239,83,80,.35)";
+  resetBtn.style.color = "#fca5a5";
+  resetBtn.textContent = "🗑 重置全部";
+  resetBtn.addEventListener("click", resetAllConfig);
+  toolbar.appendChild(resetBtn);
+  decoderList.appendChild(toolbar);
+
+  const all = getAllDecoders();
+  const ids = Object.keys(all);
+  if (!ids.length) {
     const e = document.createElement("div");
     e.className = "config-empty";
-    e.textContent = "decoders.js 中暂无算法。";
+    e.textContent = "暂无算法。";
     decoderList.appendChild(e);
     return;
   }
-  fileIds.forEach((id) => {
-    const d = fileDecoders[id];
+  ids.sort((a, b) => {
+    const ca = userDecoders[a] ? 0 : 1;
+    const cb = userDecoders[b] ? 0 : 1;
+    if (ca !== cb) return ca - cb;
+    return a.localeCompare(b);
+  });
+
+  ids.forEach((id) => {
+    const d = all[id];
+    const isOverridden = !!userDecoders[id];
+    const isBuiltinOriginal = !isOverridden && !!BUILTIN_DECODERS[id];
+    const isCustomPure = !BUILTIN_DECODERS[id];
+
     const item = document.createElement("div");
     item.className = "config-item";
-    const comp = getCompiledCustom(id);
+
+    const comp = isOverridden ? getCompiled(id, userDecoders[id]) : { error: null };
     const errTag = comp.error ? `<span class="badge-error">编译错误</span>` : "";
     const encTag = d.encode ? `<span class="badge-keys">含加密函数</span>` : "";
-    const preview = (d.code || "").split("\n")[0].slice(0, 80);
+    let typeTag = "";
+    if (isCustomPure) typeTag = `<span class="badge-file">自定义</span>`;
+    else if (isOverridden) typeTag = `<span class="badge-header">内置</span><span class="badge-keys">已覆盖</span>`;
+    else typeTag = `<span class="badge-header">内置</span>`;
+
+    const libsTag = (d.libs && d.libs.length)
+      ? d.libs.map((n) => {
+          const ok = loadedLibs.has(n);
+          const color = ok ? "#86efac" : "#fca5a5";
+          const bg = ok ? "rgba(34,140,60,.2)" : "rgba(239,83,80,.2)";
+          return `<span style="background:${bg};color:${color};padding:2px 8px;border-radius:5px;font-size:10.5px;font-weight:500;">🔗 ${escapeHtml(n)}</span>`;
+        }).join("")
+      : "";
+
+    const src = isOverridden ? userDecoders[id].code : (BUILTIN_DECODERS[id]?.code || "");
+    const preview = (src || "").split("\n")[0].slice(0, 80) + ((src || "").includes("\n") ? "…" : "");
+
+    const actions = [`<button data-action="export">📤 导出</button>`];
+    actions.push(`<button data-action="edit">编辑</button>`);
+    if (isOverridden && BUILTIN_DECODERS[id]) actions.push(`<button data-action="reset" title="恢复为内置">重置</button>`);
+    if (isOverridden || isCustomPure) actions.push(`<button data-action="delete" class="danger">删除</button>`);
+
     item.innerHTML = `
       <div class="config-item-main">
-        <div class="config-item-title">${escapeHtml(d.label)} <span class="config-item-id">${escapeHtml(id)}</span><span class="badge-file">文件</span>${encTag}${errTag}</div>
-        <div class="config-item-preview">${escapeHtml(preview)}${d.code?.includes("\n") ? "…" : ""}</div>
+        <div class="config-item-title">${escapeHtml(d.label)} <span class="config-item-id">${escapeHtml(id)}</span>${typeTag}${encTag}${libsTag}${errTag}</div>
+        <div class="config-item-preview">${escapeHtml(preview)}</div>
       </div>
-      <div class="config-item-actions">
-        <button data-action="edit">编辑</button>
-        <button data-action="delete" class="danger">删除</button>
-      </div>
+      <div class="config-item-actions">${actions.join("")}</div>
     `;
+
+    item.querySelector('[data-action="export"]').addEventListener("click", () => {
+      try { exportSingleDecoderJs(id); showToast(`已导出「${id}」`, "ok"); }
+      catch (e) { showToast("导出失败: " + e.message, "err"); }
+    });
     item.querySelector('[data-action="edit"]').addEventListener("click", () => editDecoder(id));
-    item.querySelector('[data-action="delete"]').addEventListener("click", () => deleteDecoder(id));
+
+    const resetBtn2 = item.querySelector('[data-action="reset"]');
+    if (resetBtn2) resetBtn2.addEventListener("click", () => {
+      if (!confirm(`恢复「${id}」为内置版本？`)) return;
+      delete userDecoders[id];
+      _compiledFns.delete(id);
+      if (!saveJSON(LS_KEYS.userDecoders, userDecoders)) return;
+      refreshConfig();
+      renderDecoderList();
+      showToast(`已重置「${id}」`, "ok");
+    });
+
+    const delBtn = item.querySelector('[data-action="delete"]');
+    if (delBtn) delBtn.addEventListener("click", () => {
+      const isBuiltinOverride = !!BUILTIN_DECODERS[id];
+      const msg = isBuiltinOverride ? `删除对「${id}」的覆盖（恢复为内置版本）？` : `删除自定义算法「${id}」？`;
+      if (!confirm(msg)) return;
+      delete userDecoders[id];
+      _compiledFns.delete(id);
+      if (!saveJSON(LS_KEYS.userDecoders, userDecoders)) return;
+      refreshConfig();
+      renderDecoderList();
+      showToast(`已删除「${id}」`, "ok");
+    });
+
     decoderList.appendChild(item);
   });
 }
+
 function editDecoder(id) {
-  const d = fileDecoders[id];
+  const all = getAllDecoders();
+  const d = all[id];
   if (!d) return;
+  const isOverridden = !!userDecoders[id];
+  const src = isOverridden ? userDecoders[id] : (BUILTIN_DECODERS[id] || { code: "", encode: "" });
   editingDecoderId = id;
   decoderIdInput.value = id;
   decoderIdInput.disabled = true;
   decoderLabelInput.value = d.label || "";
-  decoderCodeInput.value = d.code || "";
-  decoderEncodeInput.value = d.encode || "";
+  decoderCodeInput.value = src.code || "";
+  decoderEncodeInput.value = src.encode || "";
+  const libsInput = document.getElementById("decoderLibsInput");
+  if (libsInput) libsInput.value = (userDecoders[id]?.libs || (BUILTIN_DECODERS[id]?.libs) || []).join(", ");
   fillTemplateSelect();
   decoderTemplateSelect.value = "";
   decoderFormError.style.display = "none";
   decoderForm.style.display = "block";
   addDecoderBtn.style.display = "none";
   decoderForm.scrollIntoView({ behavior: "smooth", block: "nearest" });
-}
-async function deleteDecoder(id) {
-  if (!confirm(`从 decoders.js 删除「${id}」？`)) return;
-  const backup = fileDecoders[id];
-  delete fileDecoders[id];
-  _compiledFns.delete(id);
-  try {
-    await rewriteDecodersFile();
-    await reloadFiles();
-    renderDecoderList();
-    showToast(`已删除「${id}」`, "ok");
-  } catch (e) {
-    fileDecoders[id] = backup;
-    renderDecoderList();
-    showToast("写回失败: " + e.message, "err");
-  }
 }
 function hideDecoderForm() {
   decoderForm.style.display = "none";
@@ -2685,6 +2970,8 @@ addDecoderBtn.addEventListener("click", () => {
   decoderLabelInput.value = "";
   decoderCodeInput.value = "";
   decoderEncodeInput.value = "";
+  const libsInput = document.getElementById("decoderLibsInput");
+  if (libsInput) libsInput.value = "";
   decoderFormError.style.display = "none";
   decoderForm.style.display = "block";
   addDecoderBtn.style.display = "none";
@@ -2716,14 +3003,14 @@ function fillTemplateSelect() {
   }
   decoderTemplateSelect.value = cur;
 }
-saveDecoderBtn.addEventListener("click", async () => {
+saveDecoderBtn.addEventListener("click", () => {
   const id = editingDecoderId || decoderIdInput.value.trim();
   const label = decoderLabelInput.value.trim();
   const code = decoderCodeInput.value;
   const encode = decoderEncodeInput.value.trim();
   if (!id) return showDecoderError("请填写 ID");
   if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(id)) return showDecoderError("ID 必须是合法 JS 标识符");
-  if (!editingDecoderId && (BUILTIN_DECODERS[id] || fileDecoders[id])) return showDecoderError(`"${id}" 已存在`);
+  if (!editingDecoderId && getAllDecoders()[id]) return showDecoderError(`"${id}" 已存在`);
   if (!label) return showDecoderError("请填写名称");
   if (!code.trim()) return showDecoderError("请填写代码");
   const comp = compileDecoderCode(code);
@@ -2732,62 +3019,158 @@ saveDecoderBtn.addEventListener("click", async () => {
     const encodeComp = compileDecoderCode(encode);
     if (encodeComp.error) return showDecoderError("加密函数编译失败：\n" + encodeComp.error);
   }
+  const libsInput = document.getElementById("decoderLibsInput");
+  const libs = libsInput
+    ? libsInput.value.split(",").map((s) => s.trim()).filter(Boolean)
+    : (userDecoders[id]?.libs || []);
   const wasEditing = !!editingDecoderId;
-  fileDecoders[id] = { label, code, encode, cdn: fileDecoders[id]?.cdn || [] };
+  userDecoders[id] = { label, code, encode, libs, cdn: userDecoders[id]?.cdn || [] };
   _compiledFns.delete(id);
-  try {
-    await rewriteDecodersFile();
-    hideDecoderForm();
-    await reloadFiles();
-    showToast(wasEditing ? `已更新「${label}」` : `已添加「${label}」`, "ok");
-  } catch (e) {
-    showDecoderError("写入失败: " + e.message);
+  if (!saveJSON(LS_KEYS.userDecoders, userDecoders)) return showDecoderError("localStorage 写入失败");
+  refreshConfig();
+  renderDecoderList();
+  hideDecoderForm();
+  if (state.har) {
+    rebuildEntryList();
+    if (state.currentIndex >= 0) renderDetail();
   }
+  showToast(wasEditing ? `已更新「${label}」` : `已添加「${label}」`, "ok");
 });
-async function renderPluginList() {
-  const list = $("pluginList");
+
+// ================================================================
+// 库 UI（懒加载版）
+// ================================================================
+async function handleLibFiles(files) {
+  for (const file of files) {
+    if (!/\.js$/i.test(file.name) && file.type !== "application/javascript") {
+      showToast(`跳过非 JS 文件: ${file.name}`, "err");
+      continue;
+    }
+    try {
+      const code = await file.text();
+      const defName = guessLibName(file.name);
+      const name = prompt(`「${file.name}」的库名（全局变量名）:`, defName);
+      if (!name) continue;
+      await saveLib(name.trim(), code);
+      showToast(`已保存「${name.trim()}」（用到时自动加载）`, "ok");
+    } catch (e) {
+      showToast(`「${file.name}」失败: ${e.message}`, "err");
+    }
+  }
+  await renderLibList();
+}
+
+async function renderLibList() {
+  const list = document.getElementById("libList");
+  if (!list) return;
   list.innerHTML = "";
   try {
-    const r = await window.electronAPI.listPlugins();
-    $("pluginsDirPath").textContent = r.dir;
-    if (!r.files || !r.files.length) {
-      const e = document.createElement("div");
-      e.className = "config-empty";
-      e.textContent = "暂无插件。点击「打开插件目录」把 UMD .js 文件复制进去。";
-      list.appendChild(e);
-      return;
-    }
-    for (const f of r.files) {
-      const loaded = loadedPlugins.has(f.name);
-      const globals = [...(pluginGlobals.get(f.name) || [])].filter(isValidParamName);
-      const badge = loaded ? `<span class="badge-file">已加载</span>` : `<span class="badge-error">未加载</span>`;
-      const libTags = globals.map((n) => `<span class="badge-keys">${escapeHtml(n)}</span>`).join("");
-      const item = document.createElement("div");
-      item.className = "config-item";
-      item.innerHTML = `
-        <div class="config-item-main">
-          <div class="config-item-title">${escapeHtml(f.name)} <span class="config-item-id">${f.size} 字节</span>${badge}${libTags}</div>
-          <div class="config-item-preview">${escapeHtml((f.content || "").slice(0, 100))}…</div>
-        </div>
-        <div class="config-item-actions">
-          <button data-action="delete" class="danger">删除</button>
-        </div>
-      `;
-      item.querySelector('[data-action="delete"]').addEventListener("click", async () => {
-        if (!confirm(`删除插件「${f.name}」？`)) return;
-        await window.electronAPI.deletePlugin(f.name);
-        unloadPlugin(f.name);
-        await renderPluginList();
-        showToast(`已删除「${f.name}」并卸载`, "ok");
-      });
-      list.appendChild(item);
-    }
+    await refreshLibIndex();
   } catch (e) {
     const err = document.createElement("div");
     err.className = "config-empty";
-    err.textContent = "读取失败: " + e.message;
+    err.textContent = "读取 IndexedDB 失败: " + e.message;
     list.appendChild(err);
+    return;
   }
+  const names = [..._libIndex.keys()].sort();
+  if (!names.length) {
+    const e = document.createElement("div");
+    e.className = "config-empty";
+    e.textContent = "还没有保存的库。把 .js 文件拖到上方，或粘贴代码保存。";
+    list.appendChild(e);
+    return;
+  }
+  for (const name of names) {
+    const lib = _libIndex.get(name);
+    const loaded = loadedLibs.has(name);
+    const globals = [...(pluginGlobals.get(name) || [])].filter(isValidParamName);
+    const badge = loaded ? `<span class="badge-file">已加载</span>` : `<span class="badge-error">按需</span>`;
+    const libTags = globals.map((n) => `<span class="badge-keys">${escapeHtml(n)}</span>`).join("");
+    const kb = (lib.size / 1024).toFixed(1);
+    const item = document.createElement("div");
+    item.className = "config-item";
+    item.innerHTML = `
+      <div class="config-item-main">
+        <div class="config-item-title">${escapeHtml(name)} <span class="config-item-id">${kb} KB</span>${badge}${libTags}</div>
+        <div class="config-item-preview">${escapeHtml((lib.code || "").slice(0, 100))}…</div>
+      </div>
+      <div class="config-item-actions">
+        <button data-action="reload" ${loaded ? "" : "disabled"}>重新加载</button>
+        <button data-action="delete" class="danger">删除</button>
+      </div>
+    `;
+    item.querySelector('[data-action="reload"]').addEventListener("click", async () => {
+      try { await reloadLib(name); await renderLibList(); showToast(`已重载「${name}」`, "ok"); }
+      catch (e) { showToast("重载失败: " + e.message, "err"); }
+    });
+    item.querySelector('[data-action="delete"]').addEventListener("click", async () => {
+      if (!confirm(`删除库「${name}」？`)) return;
+      await deleteLib(name);
+      await renderLibList();
+      showToast(`已删除「${name}」`, "ok");
+    });
+    list.appendChild(item);
+  }
+}
+
+function initLibUI() {
+  const dropZone = document.getElementById("libDropZone");
+  const fileInput = document.getElementById("libFileInput");
+  const nameInput = document.getElementById("libNameInput");
+  const codeInput = document.getElementById("libCodeInput");
+  const saveBtn = document.getElementById("saveLibBtn");
+  if (!dropZone || !fileInput) return;
+
+  dropZone.addEventListener("click", () => fileInput.click());
+  dropZone.addEventListener("dragover", (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropZone.classList.add("dragover");
+  });
+  dropZone.addEventListener("dragleave", (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropZone.classList.remove("dragover");
+  });
+  dropZone.addEventListener("drop", async (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dropZone.classList.remove("dragover");
+    const files = Array.from(e.dataTransfer.files || []);
+    if (files.length) await handleLibFiles(files);
+  });
+  fileInput.addEventListener("change", async () => {
+    const files = Array.from(fileInput.files || []);
+    if (files.length) await handleLibFiles(files);
+    fileInput.value = "";
+  });
+  if (saveBtn && nameInput && codeInput) {
+    saveBtn.addEventListener("click", async () => {
+      try {
+        const name = nameInput.value.trim();
+        const code = codeInput.value;
+        await saveLib(name, code);
+        nameInput.value = "";
+        codeInput.value = "";
+        await renderLibList();
+        showToast(`已保存「${name}」（用到时自动加载）`, "ok");
+      } catch (e) { showToast(e.message, "err"); }
+    });
+    codeInput.addEventListener("dragover", (e) => e.preventDefault());
+    codeInput.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer.files || []);
+      if (files.length) await handleLibFiles(files);
+      else {
+        const text = e.dataTransfer.getData("text");
+        if (text) codeInput.value = text;
+      }
+    });
+  }
+
+  const reloadBtn = document.getElementById("reloadPluginsBtn");
+  if (reloadBtn) reloadBtn.addEventListener("click", async () => {
+    try { await reloadAllLoadedLibs(); await renderLibList(); showToast("已重载所有已加载的库", "ok"); }
+    catch (e) { showToast("重载失败: " + e.message, "err"); }
+  });
 }
 
 // ================================================================
@@ -2798,8 +3181,13 @@ async function renderPluginList() {
   autoAllBtn.disabled = true;
   exportBtn.disabled = true;
   exportListBtn.disabled = true;
-  await loadPlugins();
-  await reloadFiles();
+  try { await refreshLibIndex(); }
+  catch (e) { console.error("[HAR-Decrypt] 读取 IndexedDB 失败:", e); }
+  seedFromScriptsIfNeeded();
+  reloadConfig();
   fillTemplateSelect();
-  console.log("%c[HAR-Decrypt] ✅ 初始化完成", "color:#7ddf7d;font-weight:bold");
+  initLibUI();
+  // 首次渲染（用户打开配置时也会再 render 一次）
+  try { await renderLibList(); } catch {}
+  console.log("%c[HAR-Decrypt] ✅ 初始化完成（库使用懒加载）", "color:#7ddf7d;font-weight:bold");
 })();

@@ -28,7 +28,11 @@
     "files": [
       "main.js",
       "preload.js",
-      "renderer/**/*",
+      "index.js",
+      "pako.min.js",
+      "panel.js",
+      "background.avif",
+      
       "package.json"
     ],
     "win": {

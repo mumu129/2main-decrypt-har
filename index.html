@@ -12,7 +12,7 @@
   body {
     display: flex; flex-direction: column;
     background-color: transparent;
-    background-image: url('./e94b1e49-c518-40d6-98e3-dffab6cc370d.avif');
+    background-image: url('./background.avif');
     background-size: cover;
     background-position: center;
     background-repeat: no-repeat;
@@ -257,6 +257,7 @@
   .btn-primary:active { transform: translateY(0); box-shadow: 0 1px 4px rgba(14,99,156,.3); }
   .btn-secondary { background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.15); color: rgba(255,255,255,.8); padding: 9px 18px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-family: inherit; font-weight: 500; transition: all .15s; }
   .btn-secondary:hover { background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.25); color: #fff; }
+  .btn-secondary:disabled { opacity: .4; cursor: not-allowed; }
 
   .config-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
   .config-empty { padding: 32px; text-align: center; color: rgba(255,255,255,.3); background: rgba(255,255,255,.02); border: 1px dashed rgba(255,255,255,.1); border-radius: 12px; font-size: 12.5px; }
@@ -272,7 +273,8 @@
   .config-item-preview { font-family: "Consolas", monospace; font-size: 11px; color: rgba(255,255,255,.4); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 540px; line-height: 1.5; }
   .config-item-actions { display: flex; gap: 6px; flex-shrink: 0; }
   .config-item-actions button { padding: 6px 14px; border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.05); color: rgba(255,255,255,.75); border-radius: 6px; cursor: pointer; font-size: 11.5px; font-family: inherit; transition: all .15s; font-weight: 500; }
-  .config-item-actions button:hover { border-color: rgba(79,163,224,.6); color: #9ad0ff; background: rgba(79,163,224,.15); }
+  .config-item-actions button:hover:not(:disabled) { border-color: rgba(79,163,224,.6); color: #9ad0ff; background: rgba(79,163,224,.15); }
+  .config-item-actions button:disabled { opacity: .4; cursor: not-allowed; }
   .config-item-actions button.danger { color: #fca5a5; border-color: rgba(239,83,80,.25); }
   .config-item-actions button.danger:hover { background: rgba(239,83,80,.15); border-color: rgba(239,83,80,.5); color: #fff; }
 
@@ -291,11 +293,30 @@
   .form-actions { display: flex; gap: 10px; margin-top: 18px; }
   .form-error { background: rgba(185,28,28,.15); border: 1px solid rgba(239,83,80,.35); color: #fca5a5; padding: 12px 16px; border-radius: 8px; font-size: 12px; margin-bottom: 14px; font-family: "Consolas", monospace; white-space: pre-wrap; word-break: break-all; }
 
+  .lib-drop-zone {
+    border: 2px dashed rgba(79,163,224,.4);
+    border-radius: 12px;
+    padding: 28px;
+    text-align: center;
+    color: rgba(255,255,255,.5);
+    cursor: pointer;
+    transition: all .2s;
+    background: rgba(79,163,224,.04);
+  }
+  .lib-drop-zone:hover,
+  .lib-drop-zone.dragover {
+    border-color: rgba(79,163,224,.9);
+    background: rgba(79,163,224,.12);
+    color: #9ad0ff;
+  }
+  .lib-drop-icon { font-size: 36px; margin-bottom: 8px; }
+  .lib-drop-text { font-size: 13px; font-weight: 500; }
+  .lib-drop-hint { font-size: 11px; color: rgba(255,255,255,.35); margin-top: 4px; }
+
   .plugins-info { background: rgba(79,163,224,.08); border: 1px solid rgba(79,163,224,.2); border-radius: 10px; padding: 14px 18px; margin-top: 16px; font-size: 12px; color: rgba(255,255,255,.7); line-height: 1.9; }
   .plugins-info b { color: #9ad0ff; }
   .plugins-info code { background: rgba(255,255,255,.08); padding: 2px 7px; border-radius: 4px; font-family: "Consolas", monospace; font-size: 11px; color: rgba(255,255,255,.75); }
   .plugins-info .warn { color: rgba(255,255,255,.4); font-size: 11.5px; margin-top: 10px; }
-  .plugin-dir-path { font-family: "Consolas", monospace; font-size: 11px; color: rgba(255,255,255,.5); background: rgba(0,0,0,.35); padding: 8px 12px; border-radius: 6px; margin-bottom: 14px; word-break: break-all; border: 1px solid rgba(255,255,255,.05); }
 
   ::-webkit-scrollbar { width: 8px; height: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -349,10 +370,21 @@
       </div>
       <div class="modal-tabs">
         <button class="modal-tab active" data-tab="decoders">解密算法</button>
-        <button class="modal-tab" data-tab="plugins">第三方库</button>
+        <button class="modal-tab" data-tab="libs">第三方库</button>
       </div>
       <div class="modal-body">
         <div class="tab-pane active" data-pane="decoders">
+          <div class="plugins-info" style="margin-top:0; margin-bottom:16px;">
+            <b>📦 存储说明</b>
+            <div style="margin-top:8px;">
+              算法、域名规则、模板保存在 <b>localStorage</b>；第三方库保存在 <b>IndexedDB</b>，并按需懒加载。<br>
+              重启应用数据不丢；可编辑内置算法（显示「已覆盖」，可一键重置）。
+            </div>
+            <div class="warn">
+              ⚠️ 清除应用数据会丢配置，建议用「💾 备份 (json)」定期导出。<br>
+              💡 「🔄 从脚本重新导入」会清空应用内数据，重新从 <code>decoders.js</code> / <code>rules.js</code> 读取一次。
+            </div>
+          </div>
           <div class="panel-toolbar">
             <button class="btn-primary" id="addDecoderBtn">+ 添加算法</button>
           </div>
@@ -369,14 +401,24 @@
             </div>
             <div class="form-row"><label>显示名称</label><input type="text" id="decoderLabelInput" placeholder="例如 我的 AES 解密" autocomplete="off"></div>
             <div class="form-row">
+              <label>依赖库（可选）</label>
+              <input type="text" id="decoderLibsInput"
+                placeholder="CryptoJS, smCrypto（逗号分隔）"
+                autocomplete="off" spellcheck="false">
+              <div class="hint">
+                只有此算法<b>第一次用到</b>时才加载对应库。库名要与「第三方库」Tab 里保存的<b>库名</b>一致。<br>
+                如算法里写 <code>CryptoJS.AES.decrypt(...)</code>，这里就填 <code>CryptoJS</code>。
+              </div>
+            </div>
+            <div class="form-row">
               <label>解密函数</label>
               <textarea id="decoderCodeInput" spellcheck="false"
                 placeholder="function(text, ctx) { ... return value; }"></textarea>
               <div class="hint">
                 签名：<code>function(text, ctx)</code> 或 <code>async function(text, ctx)</code>。<br>
-                <code>text</code> 是 <b>HAR 里未做任何处理的原始字符串</b>——query / body / response / 字段值 / 请求头都直接原样传入。<br>
-                需要二进制（AES 密文、gzip 流等）时，在函数内部 <code>atob(text)</code> 自己转字节。<br>
-                可用库：<code>pako</code> 及「第三方库」Tab 中所有已加载的库。
+                <code>text</code> 是 <b>HAR 里未做任何处理的原始字符串</b>（query / body / response / 字段值 / 请求头）。<br>
+                需要二进制（AES 密文、gzip 流等）时，函数内部 <code>atob(text)</code> 自己转字节。<br>
+                可用：<code>pako</code>、<code>smartDecodeText</code> / <code>smartDecodeValue</code>、<code>base64ToBytes</code> / <code>bytesToBase64Str</code>、以及在「第三方库」中声明依赖的全局名。
               </div>
             </div>
             <div class="form-row">
@@ -385,7 +427,7 @@
                 placeholder="function(value, ctx) { ... return encodedString; }"></textarea>
               <div class="hint">
                 签名：<code>function(value, ctx)</code> 或 <code>async function(value, ctx)</code>。<br>
-                <code>value</code> 是解密结果（对象 / 字符串），返回<b>字符串</b>——即网络传输时的样子（如 base64 密文）。<br>
+                <code>value</code> 是解密结果（对象 / 字符串），返回<b>字符串</b> —— 即网络传输时的样子（如 base64 密文）。<br>
                 保存后可用于「🔒 加密对照」：<code>encode(decode(原文)) === 原文</code> 严格字符串比较。
               </div>
             </div>
@@ -396,26 +438,39 @@
           </div>
         </div>
 
-        <div class="tab-pane" data-pane="plugins">
-          <div class="panel-toolbar">
-            <button class="btn-primary" id="reloadPluginsBtn">🔄 重新加载插件</button>
-            <button class="btn-secondary" id="openPluginsDirBtn">📂 打开插件目录</button>
-          </div>
-          <div class="plugin-dir-path">📁 <span id="pluginsDirPath">加载中…</span></div>
-          <div id="pluginList" class="config-list"></div>
-          <div class="plugins-info">
-            <b>如何使用</b>
+        <div class="tab-pane" data-pane="libs">
+          <div class="plugins-info" style="margin-top:0;">
+            <b>📚 库管理（懒加载）</b>
             <div style="margin-top:8px;">
-              1. 下载 <b>UMD / IIFE</b> 版本的库文件（如 <code>crypto-js.min.js</code>、<code>bignumber.min.js</code>）<br>
-              2. 点「打开插件目录」，把文件复制进<b>该目录</b>（不要在别处）<br>
-              3. 回到本窗口点「🔄 重新加载插件」（运行中不会自动扫描新文件，下次启动会自动加载）<br>
-              4. 列表出现「已加载」及绿色全局名徽标后，算法代码即可直接调用，如 <code>CryptoJS.AES.decrypt(...)</code><br>
-              &nbsp;&nbsp;&nbsp;&nbsp;注意：新接口下 <code>text</code> 是字符串，需自己转换 —— <code>CryptoJS.enc.Utf8.parse(text)</code> 或 <code>CryptoJS.enc.Base64.parse(text)</code>
+              把 <b>UMD / IIFE</b> 库代码<b>粘贴</b>到下面，或把 <code>.js</code> 文件<b>拖拽</b>进来。库代码保存到 <code>IndexedDB</code>，重启不丢。<br>
+              <b>不会在启动时加载</b>：只有当某个算法声明了「依赖库」并<b>第一次用到该算法</b>时，才把库注入全局。
             </div>
-            <div class="warn">
-              ⚠️ 只支持单文件 UMD/IIFE 库；ESM（含 <code>export</code>/<code>import</code>）或 CommonJS（<code>require</code>）文件会显示「未加载」。<br>
-              ⚠️ 库文件暴露的全局名会自动识别并注入；未识别到时也可在代码里写 <code>window.Xxx</code>。
-            </div>
+          </div>
+
+          <div id="libDropZone" class="lib-drop-zone">
+            <div class="lib-drop-icon">📦</div>
+            <div class="lib-drop-text">拖拽 .js 文件到这里</div>
+            <div class="lib-drop-hint">或点击选择文件 · 支持 UMD / IIFE</div>
+            <input type="file" id="libFileInput" accept=".js,application/javascript" multiple style="display:none">
+          </div>
+
+          <div class="form-row" style="margin-top:16px;">
+            <label>库名（全局变量名，如 CryptoJS）</label>
+            <input type="text" id="libNameInput" placeholder="CryptoJS" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label>代码（粘贴 UMD/IIFE 库内容）</label>
+            <textarea id="libCodeInput" spellcheck="false" placeholder="// 把库代码粘贴到这里..."></textarea>
+          </div>
+          <div class="form-actions" style="margin-bottom:20px;">
+            <button class="btn-primary" id="saveLibBtn">💾 保存（用时自动加载）</button>
+          </div>
+
+          <div class="section-title">已保存的库</div>
+          <div id="libList" class="config-list"></div>
+
+          <div class="panel-toolbar" style="margin-top:20px;">
+            <button class="btn-secondary" id="reloadPluginsBtn">🔄 重载所有已加载的库</button>
           </div>
         </div>
       </div>
@@ -423,6 +478,7 @@
   </div>
 
   <script src="./pako.min.js"></script>
+  
   <script src="./panel.js"></script>
 </body>
 </html>
